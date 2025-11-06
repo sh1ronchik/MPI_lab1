@@ -10,20 +10,28 @@
 #include <mpi.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <stdint.h>
 #include <sys/stat.h>
 #include <errno.h>
 
 /* --- Утилиты --- */
-static void ensure_dir_exists(const char *path) {
-    struct stat st;
-    if (stat(path, &st) == -1) {
-        if (mkdir(path, 0755) != 0 && errno != EEXIST) {
-            fprintf(stderr, "Не удалось создать директорию %s (errno=%d)\n", path, errno);
+void ensure_dir_exists(const char *path) {
+    char tmp[512];
+    strncpy(tmp, path, sizeof(tmp));
+    tmp[sizeof(tmp)-1] = '\0';
+
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            mkdir(tmp, 0755);
+            *p = '/';
         }
     }
+    mkdir(tmp, 0755);
 }
+
 
 /* Вычисляет локальное число попаданий используя rand_r (reentrant) */
 static long long compute_local_hits(long long local_n, unsigned int *seed_p) {
@@ -35,6 +43,7 @@ static long long compute_local_hits(long long local_n, unsigned int *seed_p) {
     }
     return hits;
 }
+
 
 int main(int argc, char *argv[]) {
     MPI_Init(&argc, &argv);
@@ -49,15 +58,14 @@ int main(int argc, char *argv[]) {
     }
 
     long long total_points = atoll(argv[1]);
-    if (total_points <= 0) total_points = 1000000LL;
+    if (total_points <= 0) {
+        if (my_rank == 0) {
+            fprintf(stderr, "Error: total_points must be a positive integer (> 0), got %s\n", argv[1]);
+        }
+        MPI_Finalize();
+        return 1;
+    }
     const char *prefix = (argc >= 3) ? argv[2] : "task1";
-
-    /* Создаём директории для CSV (структура аналогична другим задачам) */
-    const char *csv_dir = "./task1/data/csv";
-    ensure_dir_exists(".");
-    ensure_dir_exists("./task1");
-    ensure_dir_exists("./task1/data");
-    ensure_dir_exists(csv_dir);
 
     /* распределение точек между процессами */
     long long base = total_points / comm_sz;
@@ -67,8 +75,12 @@ int main(int argc, char *argv[]) {
     /* уникальное семя на процесс */
     unsigned int seed_base = (unsigned int)time(NULL);
     unsigned int seed = seed_base ^ (unsigned int)(my_rank * 7919u);
-
+    
+    const char *csv_dir = "./task1/data/csv";
     if (my_rank == 0) {
+        /* Создаём директории для CSV (структура аналогична другим задачам) */
+        ensure_dir_exists(csv_dir);
+
         printf("MPI Monte Carlo: processes=%d, total_points=%lld, base=%lld, rem=%d\n",
                comm_sz, total_points, base, rem);
     }
@@ -79,22 +91,23 @@ int main(int argc, char *argv[]) {
     double overall_start, overall_end, overall_time;
 
     /* ---------- Algorithm A: blocking Send/Recv ---------- */
+    unsigned int seedA = seed; /* копия семени для варианта A */
     MPI_Barrier(MPI_COMM_WORLD);
     overall_start = MPI_Wtime();
 
     double t0 = MPI_Wtime();
-    unsigned int seedA = seed; /* копия семени для варианта A */
     long long local_hits = compute_local_hits(local_n, &seedA);
     double t1 = MPI_Wtime();
     comp_time_local = t1 - t0;
 
-    double t_comm_s = MPI_Wtime();
     long long total_hits_A = 0;
+    double t_comm_s = MPI_Wtime();
     if (my_rank == 0) {
         total_hits_A = local_hits;
+        MPI_Status st;
         for (int src = 1; src < comm_sz; ++src) {
             long long recv_val = 0;
-            MPI_Recv(&recv_val, 1, MPI_LONG_LONG, src, 100, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            MPI_Recv(&recv_val, 1, MPI_LONG_LONG, MPI_ANY_SOURCE, 100, MPI_COMM_WORLD, &st);
             total_hits_A += recv_val;
         }
     } else {
@@ -129,17 +142,17 @@ int main(int argc, char *argv[]) {
     }
 
     /* ---------- Algorithm B: MPI_Reduce ---------- */
+    unsigned int seedB = seed;
     MPI_Barrier(MPI_COMM_WORLD);
     overall_start = MPI_Wtime();
 
     t0 = MPI_Wtime();
-    unsigned int seedB = seed ^ 0x9e3779b9u;
     local_hits = compute_local_hits(local_n, &seedB);
     t1 = MPI_Wtime();
     comp_time_local = t1 - t0;
 
-    t_comm_s = MPI_Wtime();
     long long total_hits_B = 0;
+    t_comm_s = MPI_Wtime();
     MPI_Reduce(&local_hits, &total_hits_B, 1, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
     t_comm_e = MPI_Wtime();
     comm_time_local = t_comm_e - t_comm_s;
@@ -169,17 +182,17 @@ int main(int argc, char *argv[]) {
     }
 
     /* ---------- Algorithm C: non-blocking Isend/Irecv ---------- */
+    unsigned int seedC = seed;
     MPI_Barrier(MPI_COMM_WORLD);
     overall_start = MPI_Wtime();
 
     t0 = MPI_Wtime();
-    unsigned int seedC = seed ^ 0x7f4a7c15u;
     local_hits = compute_local_hits(local_n, &seedC);
     t1 = MPI_Wtime();
     comp_time_local = t1 - t0;
 
-    t_comm_s = MPI_Wtime();
     long long total_hits_C = 0;
+    t_comm_s = MPI_Wtime();
     if (comm_sz == 1) {
         total_hits_C = local_hits;
     } else if (my_rank == 0) {
