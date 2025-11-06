@@ -22,6 +22,13 @@ task2/ \
 ├── data/ \
 │    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;├── csv/             # Вывод в CSV \
 │    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└── plot/             # Графики в PNG \
+task3/ \
+├── scripts/ \
+│   ├── task3.c \
+│   └── task3_plot.py \
+├── data/ \
+│    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;├── csv/             # Вывод в CSV \
+│    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└── plot/             # Графики в PNG \
 
 ## 3. Компиляция
 Task 1
@@ -32,15 +39,23 @@ Task 2
 ```bash
 mpicc -O2 -std=c11 task2/scripts/task2.c -o task2/scripts/task2
 ```
+Task 3
+```bash
+mpicc -O2 -std=c11 task3/scripts/task3.c -o task3/scripts/task3
+```
 
 ## 4. Запуск
-Task 1: <total_points>
+Task 1: 
 ```bash
 mpiexec -n 4 ./task1/scripts/task1 10000000
 ```
-Task 2: <N[,N,...]>
+Task 2:
 ```bash
 mpiexec -n 4 ./task2/scripts/task2 "100, 500, 1000, 5000, 10000"
+```
+Task 3:
+```bash
+mpiexec -n 4 ./task3/scripts/task3 1024 task3
 ```
 
 ## 5. Форматы CSV
@@ -52,6 +67,11 @@ procs,total_points,overall_time,comp_max,comm_max,pi
 Task 2:
 ```
 procs,rows,cols,overall,comp_max,comm_max
+```
+
+Task 3:
+```
+procs,N,overall,comp_max,comm_max
 ```
 
 
@@ -66,6 +86,7 @@ Task 2
 python3 task2/scripts/task2_plot.py --prefix task2
 ```
 
-Результат:
-- Task 1: task1/data/plots/<prefix>_overall.png, _comp.png, _comm.png
-- Task 2: task2/data/plot/<prefix>_eff_P4.png, _overall_P4.png, _speedup_P4.png
+Task 3
+```bash
+python3 task3/scripts/task3_plot.py --prefix task3
+```
