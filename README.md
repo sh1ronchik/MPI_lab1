@@ -41,7 +41,7 @@ mpicc -O2 -std=c11 task2/scripts/task2.c -o task2/scripts/task2
 ```
 Task 3
 ```bash
-mpicc -O2 -std=c11 task3/scripts/task3.c -o task3/scripts/task3
+mpicc -O2 -std=c11 task3/scripts/task3.c -o task3/scripts/task3 -lm
 ```
 
 ## 4. Запуск
@@ -55,23 +55,23 @@ mpiexec -n 4 ./task2/scripts/task2 "100, 500, 1000, 5000, 10000"
 ```
 Task 3:
 ```bash
-mpiexec -n 4 ./task3/scripts/task3 1024 task3
+mpiexec -n 4 ./task3/scripts/task3 512,1024,2048 task3
 ```
 
 ## 5. Форматы CSV
 Task 1:
 ```
-procs,total_points,overall_time,comp_max,comm_max,pi
+procs,total_points,overall_time,pi
 ```
 
 Task 2:
 ```
-procs,rows,cols,overall,comp_max,comm_max
+procs,rows,cols,overall
 ```
 
 Task 3:
 ```
-procs,N,overall,comp_max,comm_max
+procs,N,overall
 ```
 
 

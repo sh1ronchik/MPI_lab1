@@ -5,7 +5,7 @@
      - algo_block (2D блочное разбиение)
 
    CSV: ./task2/data/csv/<prefix>_algo_row.csv и т.п.
-   Строка: procs,rows,cols,overall,comp_max,comm_max
+   Строка: procs,rows,cols,overall
 
    Сборка:
      mpicc -O2 -std=c11 task2/scripts/task2.c -o task2/scripts/task2
@@ -24,19 +24,25 @@
 #include <math.h>
 
 /* --- Утилиты файловой системы --- */
-static void ensure_dir(const char *path) {
-    struct stat st;
-    if (stat(path, &st) == -1) {
-        if (mkdir(path, 0755) != 0 && errno != EEXIST) {
-            fprintf(stderr, "Не удалось создать каталог %s (errno=%d)\n", path, errno);
+void ensure_dir_exists(const char *path) {
+    char tmp[512];
+    strncpy(tmp, path, sizeof(tmp));
+    tmp[sizeof(tmp)-1] = '\0';
+
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            mkdir(tmp, 0755);
+            *p = '/';
         }
     }
+    mkdir(tmp, 0755);
 }
 
 /* --- Запись результата в CSV --- */
 static void append_csv(const char *dir, const char *prefix, const char *algo,
                        int procs, int rows, int cols,
-                       double overall, double comp_max, double comm_max) {
+                       double overall) {
     char path[512];
     snprintf(path, sizeof(path), "%s/%s_%s.csv", dir, prefix, algo);
     FILE *f = fopen(path, "a");
@@ -44,14 +50,12 @@ static void append_csv(const char *dir, const char *prefix, const char *algo,
         fprintf(stderr, "Не могу открыть %s для дозаписи\n", path);
         return;
     }
-    /* Формат: procs,rows,cols,overall,comp_max,comm_max */
-    fprintf(f, "%d,%d,%d,%.9f,%.9f,%.9f\n", procs, rows, cols, overall, comp_max, comm_max);
+    /* Формат: procs,rows,cols,overall */
+    fprintf(f, "%d,%d,%d,%.9f\n", procs, rows, cols, overall);
     fclose(f);
 }
 
-/* parse_sizes_scan
-   Разбирает строку вида "R1xC1,R2xC2,...", поддерживает также одиночные числа "N" => N x N.
-*/
+/* --- Разбирает строку вида "R1xC1,R2xC2,...", поддерживает также одиночные числа "N" => N x N. --- */
 static int parse_sizes_scan(const char *s, int **out_rows, int **out_cols) {
     if (!s) { *out_rows = NULL; *out_cols = NULL; return 0; }
 
@@ -121,7 +125,6 @@ static int parse_sizes_scan(const char *s, int **out_rows, int **out_cols) {
     return cnt;
 }
 
-
 /* --- Вспомогательные: расчёт counts/displs для строк и столбцов --- */
 static void build_rows_counts(int R, int procs, int *rows, int *row_disp) {
     int base = R / procs;
@@ -151,7 +154,7 @@ static void *safe_malloc(size_t bytes) {
     return malloc(bytes);
 }
 
-/* --- Функции для печати матрицы/вектора --- */
+/* --- Функции для печати матрицы --- */
 static void print_matrix(const char *name, int R, int C, const double *A) {
     printf("%s (%dx%d):\n", name, R, C);
     for (int i = 0; i < R; ++i) {
@@ -191,6 +194,43 @@ static void seq_matvec(int R, int C, const double *A, const double *v, double *y
     }
 }
 
+/* Отладочная печать и проверка результата */
+static void debug_print_check(const char *tag, int R, int C, unsigned int fixed_seed, const double *y) {
+    if (R > 5 || C > 5) return; /* печатаем только для маленьких размеров */
+
+    double *A_ref = NULL, *v_ref = NULL;
+    generate_mat_vec(R, C, fixed_seed, &A_ref, &v_ref);
+    double *y_ref = (double*) malloc((size_t)R * sizeof(double));
+    if (!y_ref) { 
+        free(A_ref); free(v_ref);
+        return;
+    }
+    seq_matvec(R, C, A_ref, v_ref, y_ref);
+
+    print_matrix("A", R, C, A_ref);
+    print_vector("v", C, v_ref);
+    if (y) {
+        print_vector("y (алгоритм)", R, y);
+    } else {
+        printf("y (алгоритм): (NULL)\n");
+    }
+    print_vector("y (реф)", R, y_ref);
+
+    /* сравнение */
+    if (y) {
+        double max_err = 0.0;
+        for (int i = 0; i < R; ++i) {
+            double err = fabs(y[i] - y_ref[i]);
+            if (err > max_err) max_err = err;
+        }
+        printf("max abs error = %.12e\n\n", max_err);
+    } else {
+        printf("max abs error = (no algorithm result provided)\n\n");
+    }
+
+    free(A_ref); free(v_ref); free(y_ref);
+}
+
 /* ---------------- algo_row ----------------
    Разбиение по строкам:
    - root генерирует матрицу R x C и вектор длины C (фиксированный seed),
@@ -199,13 +239,13 @@ static void seq_matvec(int R, int C, const double *A, const double *v, double *y
    - MPI_Gatherv собирает результат y (длиной R) на root.
 */
 static void algo_row(int R, int C, const char *csv_dir, const char *prefix, MPI_Comm comm, unsigned int fixed_seed) {
-    int rank, procs; MPI_Comm_rank(comm, &rank); MPI_Comm_size(comm, &procs);
+    int my_rank, comm_sz; MPI_Comm_rank(comm, &my_rank); MPI_Comm_size(comm, &comm_sz);
 
     /* build rows/disp — сколько строк у каждого процесса */
-    int *rows = malloc(procs * sizeof(int));
-    int *row_disp = malloc(procs * sizeof(int));
-    build_rows_counts(R, procs, rows, row_disp);
-    int local_rows = rows[rank];
+    int *rows = malloc(comm_sz * sizeof(int));
+    int *row_disp = malloc(comm_sz * sizeof(int));
+    build_rows_counts(R, comm_sz, rows, row_disp);
+    int local_rows = rows[my_rank];
 
     /* локальные буферы */
     double *mat_local = (double*) safe_malloc((size_t)local_rows * (size_t)C * sizeof(double));
@@ -215,7 +255,7 @@ static void algo_row(int R, int C, const char *csv_dir, const char *prefix, MPI_
     double *mat = NULL;
 
     /* root генерирует полные A и v, затем упаковывает / scatterv */
-    if (rank == 0) {
+    if (my_rank == 0) {
         generate_mat_vec(R, C, fixed_seed, &mat, &vec);
     }
 
@@ -223,14 +263,13 @@ static void algo_row(int R, int C, const char *csv_dir, const char *prefix, MPI_
     MPI_Barrier(comm);
     double overall_start = MPI_Wtime();
 
-    double comm_start1 = MPI_Wtime();
-    if (rank == 0) {
-        int *sendcounts = malloc(procs * sizeof(int));
-        int *senddispls = malloc(procs * sizeof(int));
-        for (int i = 0; i < procs; ++i) { sendcounts[i] = rows[i] * C; senddispls[i] = row_disp[i] * C; }
+    if (my_rank == 0) {
+        int *sendcounts = malloc(comm_sz * sizeof(int));
+        int *senddispls = malloc(comm_sz * sizeof(int));
+        for (int i = 0; i < comm_sz; ++i) { sendcounts[i] = rows[i] * C; senddispls[i] = row_disp[i] * C; }
 
         MPI_Scatterv(mat, sendcounts, senddispls, MPI_DOUBLE,
-                     mat_local, sendcounts[rank], MPI_DOUBLE, 0, comm);
+                     mat_local, sendcounts[my_rank], MPI_DOUBLE, 0, comm);
 
         free(sendcounts); free(senddispls);
         free(mat);
@@ -244,61 +283,39 @@ static void algo_row(int R, int C, const char *csv_dir, const char *prefix, MPI_
 
     /* раздаём вектор всем */
     MPI_Bcast(vec, C, MPI_DOUBLE, 0, comm);
-    double comm_end1 = MPI_Wtime(); double comm_local1 = comm_end1 - comm_start1;
     
-    /* локальная часть: умножение локальных строк на вектор */
-    double comp_start = MPI_Wtime();
+    /* умножение локальных строк на вектор */
     for (int i = 0; i < local_rows; ++i) {
         double s = 0.0;
         double *rowptr = mat_local + (size_t)i * C;
         for (int j = 0; j < C; ++j) s += rowptr[j] * vec[j];
         y_local[i] = s;
     }
-    double comp_end = MPI_Wtime(); double comp_local = comp_end - comp_start;
 
     /* сбор локальных результатов на root */
-    double comm_start = MPI_Wtime();
-    if (rank == 0) {
+    if (my_rank == 0) {
         y = malloc((size_t)R * sizeof(double));
-        int *recvcounts = malloc(procs * sizeof(int));
-        int *recvdispls = malloc(procs * sizeof(int));
-        for (int i = 0; i < procs; ++i) { recvcounts[i] = rows[i]; recvdispls[i] = row_disp[i]; }
+        int *recvcounts = malloc(comm_sz * sizeof(int));
+        int *recvdispls = malloc(comm_sz * sizeof(int));
+        for (int i = 0; i < comm_sz; ++i) { recvcounts[i] = rows[i]; recvdispls[i] = row_disp[i]; }
         MPI_Gatherv(y_local, local_rows, MPI_DOUBLE, y, recvcounts, recvdispls, MPI_DOUBLE, 0, comm);
         free(recvcounts); free(recvdispls);
     } else {
         MPI_Gatherv(y_local, local_rows, MPI_DOUBLE, NULL, NULL, NULL, MPI_DOUBLE, 0, comm);
     }
-    double comm_end = MPI_Wtime(); double comm_local = comm_end - comm_start;
 
     MPI_Barrier(comm);
     double overall_end = MPI_Wtime();
 
-    comm_local += comm_local1;
-    /* глобальные сводные времена (максимум по процессам) */
-    double comp_max = 0.0, comm_max = 0.0;
-    MPI_Reduce(&comp_local, &comp_max, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
-    MPI_Reduce(&comm_local, &comm_max, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
-
     /* Запись результата в CSV */
-    if (rank == 0) {
-        append_csv(csv_dir, prefix, "algo_row", procs, R, C, overall_end - overall_start, comp_max, comm_max);
+    if (my_rank == 0) {
+        append_csv(csv_dir, prefix, "algo_row", comm_sz, R, C, overall_end - overall_start);
     }
 
     /* Если матрица небольшая, выведем матрицу, вектор и результат.
        и вычислим эталонный результат для сравнения. */
-    if (rank == 0 && R <= 5 && C <= 5) {
-        double *A_ref = NULL, *v_ref = NULL;
-        generate_mat_vec(R, C, fixed_seed, &A_ref, &v_ref);
-        double *y_ref = malloc((size_t)R * sizeof(double));
-        seq_matvec(R, C, A_ref, v_ref, y_ref);
-
-        printf("\n[algo_row] Проверка на root (R<=5 && C<=5)\n");
-        print_matrix("A", R, C, A_ref);
-        print_vector("v", C, v_ref);
-        print_vector("y (алгоритм)", R, y);
-        print_vector("y (реф)", R, y_ref);
-
-        free(A_ref); free(v_ref); free(y_ref);
+    if (my_rank == 0) {
+        debug_print_check("algo_row", R, C, fixed_seed, y);
     }
 
     free(mat_local); free(vec); free(y_local); free(rows); free(row_disp);
@@ -313,12 +330,12 @@ static void algo_row(int R, int C, const char *csv_dir, const char *prefix, MPI_
    - MPI_Reduce(SUM) собирает полный y на root.
 */
 static void algo_col(int R, int C, const char *csv_dir, const char *prefix, MPI_Comm comm, unsigned int fixed_seed) {
-    int rank, procs; MPI_Comm_rank(comm, &rank); MPI_Comm_size(comm, &procs);
+    int my_rank, comm_sz; MPI_Comm_rank(comm, &my_rank); MPI_Comm_size(comm, &comm_sz);
 
-    int *cols = malloc(procs * sizeof(int));
-    int *col_disp = malloc(procs * sizeof(int));
-    build_cols_counts(C, procs, cols, col_disp);
-    int local_cols = cols[rank];
+    int *cols = malloc(comm_sz * sizeof(int));
+    int *col_disp = malloc(comm_sz * sizeof(int));
+    build_cols_counts(C, comm_sz, cols, col_disp);
+    int local_cols = cols[my_rank];
 
     double *mat_sub = (double*) safe_malloc((size_t)R * (size_t)local_cols * sizeof(double));
     double *vec_sub = (double*) safe_malloc((size_t)local_cols * sizeof(double));
@@ -329,24 +346,23 @@ static void algo_col(int R, int C, const char *csv_dir, const char *prefix, MPI_
     double *vec = NULL;
 
     /* root генерирует, упаковывает в bigbuf столбцы подряд (каждая колонка — R элементов) */
-    if (rank == 0) {
+    if (my_rank == 0) {
         generate_mat_vec(R, C, fixed_seed, &mat, &vec);
     }
 
     MPI_Barrier(comm);
     double overall_start = MPI_Wtime();
 
-    double comm_start1 = MPI_Wtime();
-    if (rank == 0) {
-        int *sendcounts = malloc(procs * sizeof(int));
-        int *senddispls = malloc(procs * sizeof(int));
+    if (my_rank == 0) {
+        int *sendcounts = malloc(comm_sz * sizeof(int));
+        int *senddispls = malloc(comm_sz * sizeof(int));
         int pos = 0;
-        for (int p = 0; p < procs; ++p) { sendcounts[p] = R * cols[p]; senddispls[p] = pos; pos += sendcounts[p]; }
+        for (int p = 0; p < comm_sz; ++p) { sendcounts[p] = R * cols[p]; senddispls[p] = pos; pos += sendcounts[p]; }
 
         double *bigbuf = malloc((size_t)R * (size_t)C * sizeof(double));
         int bufpos = 0;
 
-        for (int p = 0; p < procs; ++p) {
+        for (int p = 0; p < comm_sz; ++p) {
             for (int c = col_disp[p]; c < col_disp[p] + cols[p]; ++c) {
                 for (int r = 0; r < R; ++r) bigbuf[bufpos++] = mat[r * C + c];
             }
@@ -354,7 +370,7 @@ static void algo_col(int R, int C, const char *csv_dir, const char *prefix, MPI_
 
         double *bigvec = malloc((size_t)C * sizeof(double));
         int vpos = 0;
-        for (int p = 0; p < procs; ++p) {
+        for (int p = 0; p < comm_sz; ++p) {
             for (int c = col_disp[p]; c < col_disp[p] + cols[p]; ++c) bigvec[vpos++] = vec[c];
         }
 
@@ -368,48 +384,27 @@ static void algo_col(int R, int C, const char *csv_dir, const char *prefix, MPI_
         MPI_Scatterv(NULL, NULL, NULL, MPI_DOUBLE, vec_sub, local_cols, MPI_DOUBLE, 0, comm);
     }
 
-    double comm_end1 = MPI_Wtime(); double comm_local1 = comm_end1 - comm_start1;
-
     /* локальная часть: суммируем вклады от всех локальных колонок в partial_y (размер R) */
-    double comp_start = MPI_Wtime();
     for (int i = 0; i < R; ++i) partial_y[i] = 0.0;
     for (int c = 0; c < local_cols; ++c) {
         double vloc = vec_sub[c];
         double *colptr = mat_sub + (size_t)c * R; 
         for (int r = 0; r < R; ++r) partial_y[r] += colptr[r] * vloc;
     }
-    double comp_end = MPI_Wtime(); double comp_local = comp_end - comp_start;
 
     /* редукция по суммированию partial_y в y (на root) */
-    double comm_start = MPI_Wtime();
-    if (rank == 0) y = malloc((size_t)R * sizeof(double));
+    if (my_rank == 0) y = malloc((size_t)R * sizeof(double));
     MPI_Reduce(partial_y, y, R, MPI_DOUBLE, MPI_SUM, 0, comm);
-    double comm_end = MPI_Wtime(); double comm_local = comm_end - comm_start;
 
     MPI_Barrier(comm);
     double overall_end = MPI_Wtime();
-    
-    comm_local += comm_local1;
-    double comp_max = 0.0, comm_max = 0.0;
-    MPI_Reduce(&comp_local, &comp_max, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
-    MPI_Reduce(&comm_local, &comm_max, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
 
-    if (rank == 0) append_csv(csv_dir, prefix, "algo_col", procs, R, C, overall_end - overall_start, comp_max, comm_max);
+    if (my_rank == 0) append_csv(csv_dir, prefix, "algo_col", comm_sz, R, C, overall_end - overall_start);
 
-    if (rank == 0 && R <= 5 && C <= 5) {
-        double *A_ref = NULL, *v_ref = NULL;
-        generate_mat_vec(R, C, fixed_seed, &A_ref, &v_ref);
-        double *y_ref = malloc((size_t)R * sizeof(double));
-        seq_matvec(R, C, A_ref, v_ref, y_ref);
-
-        printf("\n[algo_col] Проверка на root (R<=5 && C<=5)\n");
-        print_matrix("A", R, C, A_ref);
-        print_vector("v", C, v_ref);
-        print_vector("y (алгоритм)", R, y);
-        print_vector("y (реф)", R, y_ref);
-
-        free(A_ref); free(v_ref); free(y_ref);
+    if (my_rank == 0) {
+        debug_print_check("algo_col", R, C, fixed_seed, y);
     }
+
 
     free(mat_sub); free(vec_sub); free(partial_y); free(cols); free(col_disp);
     if (y) free(y);
@@ -425,10 +420,10 @@ static void algo_col(int R, int C, const char *csv_dir, const char *prefix, MPI_
    - на global root собирается итоговый y длины R.
 */
 static void algo_block(int R, int C, const char *csv_dir, const char *prefix, MPI_Comm comm, unsigned int fixed_seed) {
-    int rank_world, procs; MPI_Comm_rank(comm, &rank_world); MPI_Comm_size(comm, &procs);
+    int rank_world, comm_sz; MPI_Comm_rank(comm, &rank_world); MPI_Comm_size(comm, &comm_sz);
 
     int dims[2] = {0, 0};
-    MPI_Dims_create(procs, 2, dims); /* распределит числа процессов по двум измерениям */
+    MPI_Dims_create(comm_sz, 2, dims); /* распределит числа процессов по двум измерениям */
     int nprow = dims[0], npcol = dims[1];
 
     int periods[2] = {0, 0};
@@ -466,7 +461,6 @@ static void algo_block(int R, int C, const char *csv_dir, const char *prefix, MP
     MPI_Barrier(comm);
     double overall_start = MPI_Wtime();
 
-    double comm_start1 = MPI_Wtime();
     if (rank_world == 0) {
         for (int pr = 0; pr < nprow; ++pr) {
             for (int pc = 0; pc < npcol; ++pc) {
@@ -515,25 +509,18 @@ static void algo_block(int R, int C, const char *csv_dir, const char *prefix, MP
         MPI_Recv(vblock, bcol, MPI_DOUBLE, 0, MPI_ANY_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
     }
 
-    double comm_end1 = MPI_Wtime(); double comm_local1 = comm_end1 - comm_start1;
-
-    /* локальная часть умножения блока */
-    double comp_start = MPI_Wtime();
+    /* умножение блока */
     for (int i = 0; i < brow; ++i) {
         double s = 0.0;
         for (int j = 0; j < bcol; ++j) s += Ablock[i * bcol + j] * vblock[j];
         y_partial[i] = s;
     }
-    double comp_end = MPI_Wtime(); double comp_local = comp_end - comp_start;
 
-    /*
-      Теперь по строкам (фиксируем координату строки в grid) делаем MPI_Reduce.
-    */
+    /* Теперь по строкам (фиксируем координату строки в grid) делаем MPI_Reduce. */
     MPI_Comm row_comm;
     MPI_Comm_split(cart, coords[0], coords[1], &row_comm);
     int row_rank; MPI_Comm_rank(row_comm, &row_rank);
 
-    double comm_start = MPI_Wtime();
     double *y_row = NULL;
     if (row_rank == 0) y_row = malloc((size_t)brow * sizeof(double));
     MPI_Reduce(y_partial, y_row, brow, MPI_DOUBLE, MPI_SUM, 0, row_comm);
@@ -556,32 +543,16 @@ static void algo_block(int R, int C, const char *csv_dir, const char *prefix, MP
             MPI_Send(y_row, rows_per[coords[0]], MPI_DOUBLE, 0, 300 + coords[0], MPI_COMM_WORLD);
         }
     }
-    double comm_end = MPI_Wtime(); double comm_local = comm_end - comm_start;
 
     MPI_Barrier(comm);
     double overall_end = MPI_Wtime();
 
-    comm_local += comm_local1;
-    double comp_max = 0.0, comm_max = 0.0;
-    MPI_Reduce(&comp_local, &comp_max, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
-    MPI_Reduce(&comm_local, &comm_max, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
+    if (rank_world == 0) append_csv(csv_dir, prefix, "algo_block", comm_sz, R, C, overall_end - overall_start);
 
-    if (rank_world == 0) append_csv(csv_dir, prefix, "algo_block", procs, R, C, overall_end - overall_start, comp_max, comm_max);
-
-    if (rank_world == 0 && R <= 5 && C <= 5) {
-        double *A_ref = NULL, *v_ref = NULL;
-        generate_mat_vec(R, C, fixed_seed, &A_ref, &v_ref);
-        double *y_ref = malloc((size_t)R * sizeof(double));
-        seq_matvec(R, C, A_ref, v_ref, y_ref);
-
-        printf("\n[algo_block] Проверка на global root (R<=5 && C<=5)\n");
-        print_matrix("A", R, C, A_ref);
-        print_vector("v", C, v_ref);
-        print_vector("y (алгоритм)", R, y_global ? y_global : y_ref);
-        print_vector("y (реф)", R, y_ref);
-
-        free(A_ref); free(v_ref); free(y_ref);
+    if (rank_world == 0) {
+        debug_print_check("algo_block", R, C, fixed_seed, y_global);
     }
+
 
     if (row_rank == 0 && y_row) free(y_row);
     if (y_global) free(y_global);
@@ -598,10 +569,10 @@ static void algo_block(int R, int C, const char *csv_dir, const char *prefix, MP
 */
 int main(int argc, char **argv) {
     MPI_Init(&argc, &argv);
-    int rank; MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    int my_rank; MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
 
     if (argc < 2 || !argv[1] || argv[1][0] == '\0') {
-        if (rank == 0) fprintf(stderr, "Usage: %s <R1xC1,R2xC2,... | N1,N2,...> [prefix]\n", argv[0]);
+        if (my_rank == 0) fprintf(stderr, "Usage: %s <R1xC1,R2xC2,... | N1,N2,...> [prefix]\n", argv[0]);
         MPI_Finalize(); return 1;
     }
 
@@ -610,7 +581,7 @@ int main(int argc, char **argv) {
     int *cols_list = NULL;
     int cnt = parse_sizes_scan(argv[1], &rows_list, &cols_list);
     if (cnt <= 0) {
-        if (rank == 0) fprintf(stderr, "No valid sizes parsed from '%s'\n", argv[1]);
+        if (my_rank == 0) fprintf(stderr, "No valid sizes parsed from '%s'\n", argv[1]);
         MPI_Finalize();
         return 1;
     }
@@ -619,21 +590,21 @@ int main(int argc, char **argv) {
     const char *prefix = (argc >= 3) ? argv[2] : "task2";
     const char *csv_dir = "./task2/data/csv";
 
-    if (rank == 0) { ensure_dir("./task2"); ensure_dir("./task2/data"); ensure_dir(csv_dir); }
+    if (my_rank == 0) { ensure_dir_exists(csv_dir); }
     MPI_Barrier(MPI_COMM_WORLD);
 
     unsigned int fixed_seed = (unsigned int)time(NULL); /* единый seed для всех алгоритмов */
 
     for (int i = 0; i < cnt; ++i) {
         int R = rows_list[i], C = cols_list[i];
-        if (rank == 0) printf("Запускаем алгоритмы для R=%d C=%d\n", R, C);
+        if (my_rank == 0) printf("Запускаем алгоритмы для R=%d C=%d\n", R, C);
         algo_row(R, C, csv_dir, prefix, MPI_COMM_WORLD, fixed_seed);
         MPI_Barrier(MPI_COMM_WORLD);
         algo_col(R, C, csv_dir, prefix, MPI_COMM_WORLD, fixed_seed);
         MPI_Barrier(MPI_COMM_WORLD);
         algo_block(R, C, csv_dir, prefix, MPI_COMM_WORLD, fixed_seed);
         MPI_Barrier(MPI_COMM_WORLD);
-        if (rank == 0) printf("Готово R=%d C=%d\n", R, C);
+        if (my_rank == 0) printf("Готово R=%d C=%d\n", R, C);
     }
 
     free(rows_list); free(cols_list);
